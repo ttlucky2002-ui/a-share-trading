@@ -22,7 +22,7 @@ python server.py
 1. Repository 选择本项目仓库，Branch 选择 `main`。
 2. Main file path 填 `streamlit_app.py`。
 3. 需要 AI 建议时，在 Streamlit Secrets 中配置 `DEEPSEEK_API_KEY="你的key"`。
-4. 云端版默认用于研究、自选、持仓诊断、尾盘潜伏和预期计划；不建议在公开云端配置国信真实交易 AK/SK。
+4. 云端版保留市场总览、全面选股、技术选股、个股研究、AI 研究、策略回测、自选股、手动持仓诊断、尾盘潜伏、预期计划、交易复盘和运行设置；不展示国信下单和真实账户查询，也不建议在公开云端配置国信真实交易 AK/SK。
 
 本地预览 Streamlit 版：
 
