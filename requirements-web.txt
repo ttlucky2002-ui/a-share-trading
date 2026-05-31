@@ -3,3 +3,4 @@
 
 flask>=2.3
 gunicorn>=21.2  # 部署到Linux服务器时需要
+streamlit>=1.37  # Streamlit Cloud部署入口

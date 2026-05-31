@@ -4,3 +4,13 @@ __pycache__/
 charts/
 *.csv
 *.html
+.cache/
+artifacts/
+*.log
+*.mp4
+*.wav
+.env
+.streamlit/secrets.toml
+expectation_plans.json
+portfolio_positions.json
+portfolio_watchlist.json

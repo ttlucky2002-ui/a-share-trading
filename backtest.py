@@ -1,274 +1,215 @@
-"""
-回测模块 - Backtest Engine
-===========================
-历史K线回测，验证策略有效性。
-"""
-
-import pandas as pd
+"""回测引擎（小资金策略版）"""
 import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
-import warnings
-warnings.filterwarnings("ignore")
+import pandas as pd
+from typing import Optional, List
 
-from config import BACKTEST, INDICATORS
+from config import BACKTEST, RISK
 from data_feed import DataFeed
 from strategy import StrategyEngine, SignalType
 
 
 class BacktestEngine:
-    """策略回测引擎"""
+    """回测引擎"""
 
-    def __init__(self, initial_capital: float = None):
-        self.df = DataFeed()
-        self.strategy = StrategyEngine()
+    def __init__(self, initial_capital: float = None,
+                 strategy: StrategyEngine = None,
+                 data_feed: DataFeed = None):
+        self.df = data_feed if data_feed else DataFeed()
+        self.strategy = strategy if strategy else StrategyEngine()
         self.initial_capital = initial_capital or BACKTEST["initial_capital"]
         self.commission = BACKTEST["commission"]
         self.stamp_tax = BACKTEST["stamp_tax"]
         self.slippage = BACKTEST["slippage"]
         self.trade_log: List[dict] = []
 
-    def run(self, code: str, name: str = "",
-            start_date: str = "", days: int = 365) -> Optional[dict]:
-        """
-        对单只股票执行回测
-        code: 股票代码
-        days: 回测天数
-        """
-        print(f"\n📊 回测: {code} {name}  周期:{days}天")
-
-        # 获取K线
-        kline = self.df.get_kline(code, count=min(days, 800))
+    def run(self, code: str, name: str = "", days: int = 365,
+            with_benchmark: bool = True,
+            kline: pd.DataFrame = None) -> Optional[dict]:
+        kline = (
+            kline.copy().reset_index(drop=True)
+            if kline is not None else
+            self.df.get_kline(code, count=min(days, 800))
+        )
         if kline.empty or len(kline) < 30:
-            print(f"  ⚠️ 数据不足，跳过")
             return None
 
-        # 初始化
         capital = self.initial_capital
         available = capital
-        position_qty = 0
-        position_price = 0
-        position_date = None
-        position_stop = 0
-        position_take = 0
         self.trade_log = []
         equity_curve = []
-        signals_count = 0
-        win_count = 0
 
-        # 逐日回测
+        qty = 0
+        buy_price = 0
+        entry_date = None
+        highest_price = 0
+        trailing_stop = None
+        entry_signal = ""
+        peak_equity = capital
+        circuit_breaker = False
+
+        benchmark_curve = self._get_buy_hold_curve(kline.iloc[20:]) if with_benchmark else None
+
         for i in range(20, len(kline)):
-            current = kline.iloc[i]
-            prev = kline.iloc[i-1] if i > 0 else current
-            date = current["date"]
-            close = current["close"]
-            high = current["high"]
-            low = current["low"]
+            cur = kline.iloc[i]
+            date = cur["date"]
+            close = cur["close"]
+            k_up = kline.iloc[:i+1].reset_index(drop=True)
 
-            # 构建滚动K线
-            kline_up_to = kline.iloc[:i+1].reset_index(drop=True)
-
-            # ── 持仓中 → 检查卖出 ──
-            if position_qty > 0:
-                position_info = {
-                    "code": code,
-                    "name": name,
-                    "buy_price": position_price,
+            # 卖出
+            if qty > 0:
+                if close > highest_price:
+                    highest_price = close
+                sell = self.strategy.generate_sell_signals(k_up, {
+                    "code": code, "name": name,
+                    "buy_price": buy_price,
                     "current_price": close,
-                    "stop_loss": position_stop,
-                    "take_profit": position_take,
-                    "qty": position_qty,
-                }
-                sell_signal = self.strategy.generate_sell_signals(
-                    kline_up_to, position_info
-                )
-
-                if sell_signal:
-                    # 执行卖出
-                    sell_price = close * (1 - self.slippage)
-                    amount = position_qty * sell_price
-                    tax = amount * self.stamp_tax if sell_price > position_price else 0
+                    "highest_price": highest_price,
+                    "trailing_stop": trailing_stop,
+                    "entry_date": entry_date,
+                })
+                if sell:
+                    sp = close * (1 - self.slippage)
+                    amount = qty * sp
                     fee = amount * self.commission
-                    pnl = amount - position_qty * position_price - fee - tax
+                    tax = amount * self.stamp_tax
+                    pnl = amount - qty * buy_price - fee - tax
                     available += amount - fee - tax
-
-                    if pnl > 0:
-                        win_count += 1
-
                     self.trade_log.append({
-                        "买入日期": position_date,
-                        "卖出日期": date,
-                        "代码": code,
-                        "名称": name,
-                        "方向": sell_signal.signal.value,
-                        "买入价": round(position_price, 2),
-                        "卖出价": round(sell_price, 2),
-                        "数量": position_qty,
+                        "买入日期": str(entry_date)[:10] if entry_date else "",
+                        "卖出日期": str(date)[:10],
+                        "代码": code, "名称": name,
+                        "方向": sell.signal,
+                        "买入价": round(buy_price, 2),
+                        "卖出价": round(sp, 2),
+                        "数量": qty,
                         "盈亏": round(pnl, 2),
-                        "盈亏%": round((sell_price - position_price) / position_price * 100, 2),
-                        "策略": sell_signal.reason,
+                        "盈亏%": round((sp - buy_price) / buy_price * 100, 2),
+                        "策略": sell.reason,
+                        "入场信号": entry_signal[:60],
                     })
+                    qty = 0
+                    trailing_stop = None
 
-                    position_qty = 0
-                    signals_count += 1
-
-            # ── 空仓 → 检查买入 ──
-            if position_qty == 0:
-                stock_info = {"code": code, "name": name, "price": close}
-                buy_signal = self.strategy.generate_buy_signals(
-                    kline_up_to, stock_info
-                )
-                if buy_signal and buy_signal.signal == SignalType.BUY:
-                    # 执行买入
-                    buy_price = close * (1 + self.slippage)
-                    max_qty = int(available * 0.95 / buy_price / 100) * 100
+            # 买入
+            if qty == 0 and not circuit_breaker:
+                buy = self.strategy.generate_buy_signals(k_up, {
+                    "code": code, "name": name, "price": close,
+                })
+                if buy and buy.signal == SignalType.BUY:
+                    bp = close * (1 + self.slippage)
+                    max_qty, _ = self.strategy.calc_position_size(
+                        available, bp, buy.score, k_up
+                    )
                     if max_qty >= 100:
-                        position_qty = max_qty
-                        position_price = buy_price
-                        position_date = date
-                        position_stop = buy_price * (1 + self.strategy.stop_loss_pct)
-                        position_take = buy_price * (1 + self.strategy.take_profit_pct)
+                        qty = max_qty
+                        buy_price = bp
+                        entry_date = date
+                        highest_price = bp
+                        trailing_stop = None
+                        entry_signal = buy.reason
+                        cost = qty * bp
+                        available -= cost + cost * self.commission
 
-                        cost = position_qty * buy_price
-                        fee = cost * self.commission
-                        available -= cost + fee
-                        signals_count += 1
-
-            # 记录权益曲线
-            equity = available
-            if position_qty > 0:
-                equity += position_qty * close
+            ev = available + (qty * close if qty > 0 else 0)
             equity_curve.append({
-                "date": date,
-                "equity": equity,
-                "position": position_qty > 0,
-                "price": close,
+                "date": str(date)[:10], "equity": round(ev, 2),
+                "position": qty > 0, "price": float(close),
             })
+            if ev > peak_equity:
+                peak_equity = ev
+            if peak_equity > 0 and (ev - peak_equity) / peak_equity <= RISK["max_drawdown"]:
+                circuit_breaker = True
 
-        # ── 结仓 ──
-        if position_qty > 0:
-            sell_price = kline.iloc[-1]["close"] * (1 - self.slippage)
-            amount = position_qty * sell_price
+        # 期末平仓
+        if qty > 0 and len(kline) > 0:
+            cp = kline.iloc[-1]["close"]
+            sp = cp * (1 - self.slippage)
+            amount = qty * sp
             fee = amount * self.commission
-            tax = amount * self.stamp_tax if sell_price > position_price else 0
-            pnl = amount - position_qty * position_price
+            tax = amount * self.stamp_tax
             available += amount - fee - tax
-
             self.trade_log.append({
-                "买入日期": position_date,
-                "卖出日期": kline.iloc[-1]["date"],
-                "代码": code,
-                "名称": name,
+                "买入日期": str(entry_date)[:10] if entry_date else "",
+                "卖出日期": str(kline.iloc[-1]["date"])[:10],
+                "代码": code, "名称": name,
                 "方向": "期末平仓",
-                "买入价": round(position_price, 2),
-                "卖出价": round(sell_price, 2),
-                "数量": position_qty,
-                "盈亏": round(pnl, 2),
-                "盈亏%": round((sell_price - position_price) / position_price * 100, 2),
+                "买入价": round(buy_price, 2),
+                "卖出价": round(sp, 2),
+                "数量": qty,
+                "盈亏": round(amount - qty * buy_price - fee - tax, 2),
+                "盈亏%": round((sp - buy_price) / buy_price * 100, 2),
                 "策略": "期末强制平仓",
+                "入场信号": entry_signal[:60],
             })
+            equity_curve[-1]["equity"] = round(available, 2)
+            equity_curve[-1]["position"] = False
 
-        # ── 计算绩效指标 ──
-        result = self._calc_performance(equity_curve, capital)
-        result["code"] = code
-        result["name"] = name
-        result["trades"] = self.trade_log
-        result["equity_curve"] = equity_curve
+        perf = self._calc_performance(equity_curve, capital)
+        perf["code"] = code
+        perf["name"] = name
+        perf["trades"] = self.trade_log
+        perf["equity_curve"] = equity_curve
+        perf["initial_capital"] = capital
+        perf["strategy_config"] = self.strategy.get_config()
 
-        print(f"  总收益率:{result['total_return']:+.2f}%  "
-              f"年化:{result['annual_return']:+.2f}%  "
-              f"胜率:{result['win_rate']:.1f}%  "
-              f"交易次数:{signals_count}  "
-              f"最大回撤:{result['max_drawdown']:.2f}%")
-        return result
+        if benchmark_curve:
+            perf["benchmark_curve"] = benchmark_curve
+            perf["benchmark_name"] = f"{name or code} 买入持有"
+            perf["benchmark_return"] = round(benchmark_curve[-1]["value"] - 100, 2)
+            perf["excess_return"] = round(perf["total_return"] - perf["benchmark_return"], 2)
 
-    def _calc_performance(self, equity_curve: List[dict],
-                          initial: float) -> dict:
-        """计算绩效指标"""
-        if not equity_curve:
-            return {"total_return": 0, "annual_return": 0,
-                    "max_drawdown": 0, "win_rate": 0,
-                    "sharpe_ratio": 0, "trade_count": 0}
+        return perf
 
-        df_eq = pd.DataFrame(equity_curve)
-        final = df_eq["equity"].iloc[-1]
-        total_return = (final / initial - 1) * 100
+    @staticmethod
+    def _get_buy_hold_curve(period: pd.DataFrame) -> list:
+        if period.empty:
+            return []
+        base = float(period.iloc[0]["close"])
+        if base <= 0:
+            return []
+        return [{
+            "date": str(row["date"])[:10],
+            "value": round(float(row["close"]) / base * 100, 2),
+        } for _, row in period.iterrows()]
 
-        # 年化收益率
-        days = len(df_eq)
-        annual_return = ((final / initial) ** (252 / max(days, 1)) - 1) * 100
+    def _calc_performance(self, curve: List[dict], initial: float) -> dict:
+        if not curve:
+            return {}
+        df = pd.DataFrame(curve)
+        final = df["equity"].iloc[-1]
+        total = (final / initial - 1) * 100
+        annual = ((final / initial) ** (252 / max(len(df), 1)) - 1) * 100
+        df["peak"] = df["equity"].cummax()
+        df["dd"] = (df["equity"] - df["peak"]) / df["peak"] * 100
+        mdd = df["dd"].min()
 
-        # 最大回撤
-        df_eq["peak"] = df_eq["equity"].cummax()
-        df_eq["drawdown"] = (df_eq["equity"] - df_eq["peak"]) / df_eq["peak"] * 100
-        max_drawdown = df_eq["drawdown"].min()
+        wins = sum(1 for t in self.trade_log if t.get("盈亏%", 0) > 0)
+        total_trades = len(self.trade_log)
+        wr = wins / max(total_trades, 1) * 100
 
-        # 胜率
-        trades = self.trade_log
-        win_count = sum(1 for t in trades if t.get("盈亏%", 0) > 0)
-        trade_count = len(trades)
+        df["ret"] = df["equity"].pct_change().fillna(0)
+        sharpe = (df["ret"].mean() / max(df["ret"].std(), 0.001)) * np.sqrt(252)
 
-        # 夏普比率
-        df_eq["return"] = df_eq["equity"].pct_change().fillna(0)
-        sharpe = (df_eq["return"].mean() / max(df_eq["return"].std(), 0.001)) * np.sqrt(252)
+        win_pcts = [t["盈亏%"] for t in self.trade_log if t["盈亏%"] > 0]
+        loss_pcts = [t["盈亏%"] for t in self.trade_log if t["盈亏%"] <= 0]
+        aw = np.mean(win_pcts) if win_pcts else 0
+        al = abs(np.mean(loss_pcts)) if loss_pcts else 0
+        pl = round(aw / al, 2) if al > 0 else 0
 
-        # 盈亏比
-        if trade_count > 0:
-            avg_win = np.mean([t["盈亏%"] for t in trades if t["盈亏%"] > 0]) if win_count > 0 else 0
-            avg_loss = np.mean([t["盈亏%"] for t in trades if t["盈亏%"] <= 0]) if (trade_count - win_count) > 0 else 0
-            profit_loss_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0
-        else:
-            profit_loss_ratio = 0
+        exit_stats = {}
+        for t in self.trade_log:
+            d = t.get("方向", "其他")
+            exit_stats[d] = exit_stats.get(d, 0) + 1
 
         return {
-            "total_return": round(total_return, 2),
-            "annual_return": round(annual_return, 2),
-            "max_drawdown": round(max_drawdown, 2),
-            "win_rate": round(win_count / max(trade_count, 1) * 100, 1),
+            "total_return": round(total, 2),
+            "annual_return": round(annual, 2),
+            "max_drawdown": round(mdd, 2),
+            "win_rate": round(wr, 1),
             "sharpe_ratio": round(sharpe, 2),
-            "trade_count": trade_count,
-            "profit_loss_ratio": round(profit_loss_ratio, 2),
+            "trade_count": total_trades,
+            "profit_loss_ratio": pl,
+            "avg_win_pct": round(aw, 2),
+            "avg_loss_pct": round(-al, 2),
+            "exit_stats": exit_stats,
         }
-
-    def run_multi(self, codes: List[str], days: int = 365) -> pd.DataFrame:
-        """批量回测多只股票"""
-        results = []
-        for code in codes:
-            # 获取股票名称
-            stocks = self.df.get_stock_list()
-            name = ""
-            if not stocks.empty:
-                match = stocks[stocks["code"] == code]
-                if not match.empty:
-                    name = match.iloc[0]["name"]
-
-            result = self.run(code, name, days=days)
-            if result:
-                results.append(result)
-
-        if not results:
-            return pd.DataFrame()
-
-        summary = pd.DataFrame([{
-            "代码": r["code"],
-            "名称": r["name"],
-            "总收益率%": r["total_return"],
-            "年化收益率%": r["annual_return"],
-            "最大回撤%": r["max_drawdown"],
-            "胜率%": r["win_rate"],
-            "夏普比率": r["sharpe_ratio"],
-            "交易次数": r["trade_count"],
-            "盈亏比": r["profit_loss_ratio"],
-        } for r in results])
-
-        return summary.sort_values("总收益率%", ascending=False)
-
-
-if __name__ == "__main__":
-    bt = BacktestEngine()
-    result = bt.run("600519", "贵州茅台", days=250)
-    if result:
-        print(f"\n📋 交易记录 ({len(result['trades'])}笔):")
-        for t in result["trades"][-5:]:
-            print(f"  {t['买入日期']}→{t['卖出日期']} {t['方向']} "
-                  f"盈亏:{t['盈亏%']:+.2f}%")
